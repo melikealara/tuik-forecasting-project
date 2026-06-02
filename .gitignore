@@ -1,0 +1,24 @@
+# R session files
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# renv cache (not needed in repo)
+renv/library/
+renv/staging/
+
+# Temporary R files
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Exploration / scratch scripts (not part of submission)
+explore_tuikr.R
+explore_data.R
+explore_data2.R
+explore_data3.R
+verify_data.R

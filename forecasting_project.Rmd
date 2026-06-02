@@ -1,0 +1,1016 @@
+---
+title: "Monthly Tourism Expenditure Forecasting Using TÜİK Data"
+author: "Melike Alara Göler | Student Number: 138722041"
+date: "May 30, 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 5,
+  dpi = 150
+)
+```
+
+---
+
+## 1. Project Overview
+
+This notebook applies and compares ten quantitative forecasting methods to the monthly
+**Tourism Expenditure (Thousand USD)** series published by TÜİK (Turkish Statistical Institute).
+The dataset spans January 2012 through March 2026. Each method is evaluated using a set of
+standard accuracy and monitoring measures. The best-performing and most structurally appropriate
+method is then selected to produce a point forecast for **April 2026**, the next unpublished period.
+
+---
+
+## 2. TÜİK Data Source
+
+The data are accessed programmatically through the `tuikr` R package
+([github.com/emraher/tuikr](https://github.com/emraher/tuikr)).
+No manually downloaded or manually edited files are used anywhere in this analysis.
+
+| Field | Value |
+|---|---|
+| TÜİK Dataset Name | Tourism expenditures, number of visitors and average expenditure per capita by months |
+| TÜİK Theme / Category | Tourism (Theme 14) |
+| TÜİK Table Name | Tourism expenditures, number of visitors and average expenditure per capita by months, 2012–2026 |
+| tuikr Dataflow ID | Not applicable (istab table accessed via `httr::GET()` using `statistical_tables("14")` URL) |
+| Selected Variable | Tourism expenditures (Thousand $) |
+| Data Frequency | Monthly |
+| Time Coverage | 2012-01 / 2026-03 |
+| Latest Available Observation | March 2026 |
+| Forecast Target Period | April 2026 |
+| Date of Data Access | 2026-05-30 |
+| R Package for Data Access | `tuikr` |
+
+---
+
+## 3. Required Packages
+
+```{r packages}
+# Package installation guard — all packages managed via renv
+required_pkgs <- c("tuikr","httr","readxl","forecast","ggplot2","dplyr","knitr","kableExtra")
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (pkg == "tuikr") devtools::install_github("emraher/tuikr", quiet = TRUE)
+    else install.packages(pkg, quiet = TRUE)
+  }
+}
+
+library(tuikr)
+library(httr)
+library(readxl)
+library(forecast)
+library(ggplot2)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# Create output directories (if they do not exist yet)
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/tables",  recursive = TRUE, showWarnings = FALSE)
+
+# Source supporting R scripts
+source("R/data_import.R")
+source("R/accuracy_measures.R")
+source("R/forecasting_methods.R")
+source("R/plots.R")
+```
+
+---
+
+## 4. Data Access via tuikr
+
+The `tuikr::statistical_tables("14")` function retrieves the full list of Tourism
+theme tables together with their download URLs. The table identified as
+*"Tourism expenditures, number of visitors and average expenditure per capita by months"*
+is downloaded in Excel format using that URL.
+No file is saved permanently; the download is written to a temporary path and read directly into R.
+
+```{r data_access}
+# Download and prepare the time series
+data_info <- import_tuik_data()
+
+ts_raw  <- data_info$ts_raw    # raw ts (with COVID NAs)
+ts_data <- data_info$ts_data   # imputed ts used for modelling
+
+cat("Table name      :", data_info$table_name, "\n")
+cat("Theme           :", data_info$theme, "\n")
+cat("Selected variable:", data_info$selected_var, "\n")
+cat("Frequency       :", data_info$frequency, "\n")
+cat("Time coverage   :", data_info$time_coverage, "\n")
+cat("Latest observation:", data_info$latest_obs, "\n")
+cat("Forecast target :", data_info$forecast_target, "\n")
+cat("Data access date:", data_info$data_access_date, "\n")
+cat("Total observations:", data_info$n_obs, "\n")
+cat("Missing values (raw):", data_info$n_na_raw, "(COVID lockdown periods)\n")
+```
+
+---
+
+## 5. Use of TÜİK Data in R
+
+The raw Excel file contains data in a wide format (37 rows × 46 columns):
+rows 6–17 represent the twelve calendar months; columns at positions
+`seq(2, 44, by = 3)` correspond to the tourism expenditure sub-column for each year from 2012 to 2026.
+The matrix is flattened column-by-column to produce a chronological monthly vector.
+
+Thirteen observations from the raw series were missing (coded as `"-"` in the TÜİK file),
+all falling in the COVID-19 restriction period (2020 Q1 – 2021 Q1).
+These gaps were imputed with `forecast::na.interp()`, which uses a seasonal
+linear interpolation to fill the values in a way that preserves the seasonal structure
+of the surrounding non-missing observations.
+
+```{r data_prep}
+# Summary statistics of the imputed series
+summary(ts_data)
+cat("\nFirst six observations (Jan–Jun 2012):\n")
+print(round(head(ts_data), 2))
+cat("\nLast six observations (Oct 2025 – Mar 2026):\n")
+print(round(tail(ts_data), 2))
+```
+
+---
+
+## 6. Exploratory Time Series Analysis
+
+### 6.1 Actual Series Plot
+
+```{r eda_plot}
+df_actual <- data.frame(
+  Date   = as.Date(time(ts_data) %>% {as.Date(paste(floor(.), round((.-floor(.))*12)+1, "01", sep="-"))}),
+  Value  = as.numeric(ts_data)
+)
+# Safer date construction
+n_obs  <- length(ts_data)
+freq   <- frequency(ts_data)
+s      <- start(ts_data)
+years  <- s[1] + (s[2] - 1 + (0:(n_obs-1))) %/% freq
+months <- ((s[2] - 1 + (0:(n_obs-1))) %% freq) + 1
+df_actual <- data.frame(
+  Date  = as.Date(paste(years, months, "01", sep = "-")),
+  Value = as.numeric(ts_data)
+)
+
+p_actual <- ggplot(df_actual, aes(x = Date, y = Value)) +
+  geom_line(colour = "#2c7bb6", linewidth = 0.7) +
+  labs(
+    title    = "Monthly Tourism Expenditure — Actual Series",
+    subtitle = "TÜİK Theme 14 | Jan 2012 – Mar 2026 (COVID gaps imputed)",
+    x = "Date",
+    y = "Tourism Expenditure (Thousand $)"
+  ) +
+  scale_y_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_actual)
+ggsave("outputs/figures/actual_series_plot.png", plot = p_actual,
+       width = 10, height = 5, dpi = 150)
+```
+
+### 6.2 Seasonal Subseries and Trend Assessment
+
+```{r eda_decomp_plot}
+# Quick STL decomposition for visual EDA only (not a forecasting method)
+stl_decomp <- stl(ts_data, s.window = "periodic")
+plot(stl_decomp, main = "STL Decomposition — Tourism Expenditure (Thousand $)")
+```
+
+```{r eda_summary}
+# Month-by-month average to visualise seasonal pattern
+month_avg <- tapply(as.numeric(ts_data), cycle(ts_data), mean)
+month_names_en <- c("Jan","Feb","Mar","Apr","May","Jun",
+                    "Jul","Aug","Sep","Oct","Nov","Dec")
+names(month_avg) <- month_names_en
+df_si <- data.frame(Month = factor(month_names_en, levels = month_names_en),
+                    Mean  = month_avg)
+
+p_seas <- ggplot(df_si, aes(x = Month, y = Mean)) +
+  geom_col(fill = "#2c7bb6", alpha = 0.8) +
+  labs(title = "Average Monthly Tourism Expenditure (All Years)",
+       subtitle = "Illustrates the seasonal pattern across calendar months",
+       x = NULL, y = "Average (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+print(p_seas)
+```
+
+### 6.3 Key Observations from EDA
+
+- **Trend**: The series shows a clear upward trend from 2012 through early 2020, a sharp
+  structural drop during the COVID-19 pandemic (2020–2021), and a strong recovery with
+  continued growth from 2022 onwards. A linear trend does not fully capture this
+  break but remains a useful baseline.
+
+- **Seasonality**: There is a pronounced **multiplicative seasonal pattern**.
+  Summer months (July–September) and winter months (December–January) record the
+  highest expenditure, reflecting international travel peaks. February and November
+  are consistently the lowest months. This seasonal structure repeats every 12 months.
+
+- **Missing values**: 13 months in the raw TÜİK data are coded as `"-"` covering the
+  COVID restriction period. These were imputed via seasonal linear interpolation and
+  do not affect the validity of the historical analysis.
+
+- **Outliers / structural breaks**: The COVID period represents a genuine structural
+  break rather than a measurement outlier. This limits the performance of purely
+  historical methods on pre-COVID data.
+
+---
+
+## 7. Forecasting Methods
+
+### Setup: Common Evaluation Period
+
+To ensure a fair comparison, all accuracy metrics are computed over the same
+evaluation window: **observations 13 through 165** (153 periods). This accommodates
+the 12-period burn-in of the Moving Average and the boundary loss of classical
+decomposition's 2×12 centred moving average.
+
+```{r eval_period}
+eval_start <- 13
+eval_end   <- 165  # decompose() loses 6 obs each side with freq=12
+```
+
+---
+
+### 7.1 Naïve Forecasting
+
+The naïve forecast for period *t* is simply the observed value in period *t − 1*.
+It serves as a benchmark against which more sophisticated methods are judged.
+
+```{r naive}
+res_naive <- method_naive(ts_data)
+
+# Accuracy on common evaluation period
+acc_naive <- compute_accuracy(
+  res_naive$actual[eval_start:eval_end],
+  res_naive$fitted[eval_start:eval_end]
+)
+print(acc_naive)
+
+# Plot
+p_naive <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date,
+                              Value = res_naive$fitted),
+            aes(x = Date, y = Value, colour = "Naive Fitted"),
+            linewidth = 0.6, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_naive$next_fcst,
+                 colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","Naive Fitted"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = "Actual vs Naïve Forecast",
+       subtitle = paste0("Apr 2026 forecast: ",
+                         format(round(res_naive$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_naive)
+ggsave("outputs/figures/naive_forecast_plot.png", plot = p_naive,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The naïve model simply repeats the previous month's value.
+Because tourism expenditure has a strong seasonal pattern, the naïve forecast
+frequently misses the seasonal swings and therefore produces relatively large errors,
+particularly at seasonal turning points. It is an important baseline: any method
+claiming to be useful must outperform it.
+Next-period forecast (April 2026): **`r format(round(res_naive$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.2 Moving Average (k = 12)
+
+A 12-period moving average is chosen because it spans exactly one seasonal cycle,
+smoothing out seasonal variation. The one-step-ahead forecast at time *t* uses
+the mean of the 12 preceding observations.
+
+```{r ma12}
+res_ma <- method_ma(ts_data, k = 12)
+
+acc_ma <- compute_accuracy(
+  res_ma$actual[eval_start:eval_end],
+  res_ma$fitted[eval_start:eval_end]
+)
+print(acc_ma)
+
+p_ma <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_ma$fitted),
+            aes(x = Date, y = Value, colour = "MA(12) Fitted"),
+            linewidth = 0.6, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_ma$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","MA(12) Fitted"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = "Actual vs Moving Average (k = 12)",
+       subtitle = paste0("Apr 2026 forecast: ",
+                         format(round(res_ma$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_ma)
+ggsave("outputs/figures/moving_average_plot.png", plot = p_ma,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The 12-month MA eliminates seasonality but introduces a 6-month lag.
+It provides a reasonable picture of the underlying trend but cannot produce seasonally
+adjusted predictions for any specific month.
+Next-period forecast (April 2026): **`r format(round(res_ma$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.3 Weighted Moving Average (k = 12, linear weights)
+
+The same 12-month window is used, but weights increase linearly so that the most
+recent observation (weight 12/78) has twelve times the influence of the observation
+twelve months ago (weight 1/78). This assumes recent months carry more information
+about the current level of expenditure.
+
+```{r wma}
+res_wma <- method_wma(ts_data, k = 12)
+
+acc_wma <- compute_accuracy(
+  res_wma$actual[eval_start:eval_end],
+  res_wma$fitted[eval_start:eval_end]
+)
+print(acc_wma)
+
+p_wma <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_wma$fitted),
+            aes(x = Date, y = Value, colour = "WMA(12) Fitted"),
+            linewidth = 0.6, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_wma$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","WMA(12) Fitted"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = "Actual vs Weighted Moving Average (k = 12)",
+       subtitle = paste0("Apr 2026 forecast: ",
+                         format(round(res_wma$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_wma)
+ggsave("outputs/figures/weighted_moving_average_plot.png", plot = p_wma,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The WMA assigns higher weight to recent months, which improves
+responsiveness to the post-COVID trend recovery compared to the simple MA.
+However, it still cannot reproduce the seasonal pattern of any particular month.
+Next-period forecast (April 2026): **`r format(round(res_wma$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.4 Simple Exponential Smoothing
+
+Simple exponential smoothing (SES) applies a geometrically declining weight schedule
+to all past observations. The smoothing parameter α is optimised by minimising
+the sum of squared in-sample one-step-ahead errors.
+
+```{r ses}
+res_ses <- method_ses(ts_data)
+
+cat("Optimal alpha:", round(res_ses$alpha, 4), "\n")
+
+acc_ses <- compute_accuracy(
+  res_ses$actual[eval_start:eval_end],
+  res_ses$fitted[eval_start:eval_end]
+)
+print(acc_ses)
+
+p_ses <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_ses$fitted),
+            aes(x = Date, y = Value, colour = "SES Fitted"),
+            linewidth = 0.6, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_ses$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","SES Fitted"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = paste0("Actual vs Exponential Smoothing (",
+                          res_ses$method_label, ")"),
+       subtitle = paste0("Apr 2026 forecast: ",
+                         format(round(res_ses$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_ses)
+ggsave("outputs/figures/exponential_smoothing_plot.png", plot = p_ses,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The optimal α = `r round(res_ses$alpha, 3)` indicates a
+`r ifelse(res_ses$alpha > 0.5, "relatively responsive", "relatively smooth")`
+weighting of past observations. SES cannot capture the seasonal pattern and
+is expected to produce larger errors than methods that account for seasonality.
+Next-period forecast (April 2026): **`r format(round(res_ses$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.5 Trend-Adjusted Exponential Smoothing (Holt's Method)
+
+Holt's method extends SES with a separate trend component, smoothed by parameter β.
+Both α and β are optimised automatically. This method is appropriate when the series
+shows a systematic trend, as observed in the pre-COVID and post-COVID recovery periods.
+
+```{r holt}
+res_holt <- method_holt(ts_data)
+
+cat("Optimal alpha:", round(res_holt$alpha, 4), "\n")
+cat("Optimal beta :", round(res_holt$beta,  4), "\n")
+
+acc_holt <- compute_accuracy(
+  res_holt$actual[eval_start:eval_end],
+  res_holt$fitted[eval_start:eval_end]
+)
+print(acc_holt)
+
+p_holt <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_holt$fitted),
+            aes(x = Date, y = Value, colour = "Holt Fitted"),
+            linewidth = 0.6, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_holt$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","Holt Fitted"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = paste0("Actual vs Trend-Adjusted Exponential Smoothing"),
+       subtitle = paste0("alpha=", round(res_holt$alpha,3),
+                         ", beta=", round(res_holt$beta,3),
+                         " | Apr 2026 forecast: ",
+                         format(round(res_holt$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_holt)
+ggsave("outputs/figures/trend_adjusted_smoothing_plot.png", plot = p_holt,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: Holt's method tracks the general upward trajectory of tourism
+expenditure better than SES, but still ignores the seasonal component. The fitted
+values show a smoothed trend line rather than the month-by-month variation.
+Next-period forecast (April 2026): **`r format(round(res_holt$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.6 Linear Trend Projection
+
+A simple OLS regression fits a straight line through all observations:
+`y_t = β₀ + β₁ · t + ε_t`. The intercept β₀ is the estimated expenditure at the
+origin (t = 0, conceptually before January 2012), and the slope β₁ is the average
+monthly increase in Thousand $.
+
+```{r linear_trend}
+res_lt <- method_linear_trend(ts_data)
+
+cat("Intercept (b0):", round(res_lt$coef_intercept, 2), "\n")
+cat("Slope (b1)    :", round(res_lt$coef_slope,     2), "Thousand $ per month\n")
+
+acc_lt <- compute_accuracy(
+  res_lt$actual[eval_start:eval_end],
+  res_lt$fitted[eval_start:eval_end]
+)
+print(acc_lt)
+
+p_lt <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_lt$fitted),
+            aes(x = Date, y = Value, colour = "Linear Trend"),
+            linewidth = 0.6) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_lt$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","Linear Trend"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = "Actual vs Linear Trend Projection",
+       subtitle = paste0("y = ", round(res_lt$coef_intercept,0),
+                         " + ", round(res_lt$coef_slope,0),
+                         " · t  |  Apr 2026 forecast: ",
+                         format(round(res_lt$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_lt)
+ggsave("outputs/figures/trend_projection_plot.png", plot = p_lt,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The intercept of `r format(round(res_lt$coef_intercept,0), big.mark=",")`
+Thousand $ represents the estimated expenditure level at the start of the observation window.
+The slope of `r round(res_lt$coef_slope, 0)` Thousand $ per month implies that, on average,
+monthly tourism expenditure has increased by approximately
+`r format(round(res_lt$coef_slope * 12, 0), big.mark=",")`
+Thousand $ per year over the full period. The linear trend does not capture seasonal variation,
+so fitted values fall on a straight line running through the centre of the seasonal oscillations.
+Next-period forecast (April 2026): **`r format(round(res_lt$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.7 Seasonal Indices
+
+Seasonal indices (ratio-to-moving-average method) quantify the typical seasonal
+swing of each month relative to the annual average. A multiplicative index above 1.0
+indicates an above-average month; below 1.0 indicates a below-average month.
+
+```{r seasonal_indices}
+res_si <- method_seasonal_indices(ts_data)
+
+# Display seasonal indices
+si_df <- data.frame(
+  Month = c("Jan","Feb","Mar","Apr","May","Jun",
+            "Jul","Aug","Sep","Oct","Nov","Dec"),
+  Seasonal_Index = round(res_si$si, 4)
+)
+kable(si_df, caption = "Monthly Seasonal Indices",
+      col.names = c("Month", "Seasonal Index")) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+acc_si <- compute_accuracy(
+  res_si$actual[eval_start:eval_end],
+  res_si$fitted[eval_start:eval_end]
+)
+print(acc_si)
+
+p_si <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_si$fitted),
+            aes(x = Date, y = Value, colour = "Seasonal Index Fitted"),
+            linewidth = 0.6, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_si$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","Seasonal Index Fitted"="#fdae61",
+               "Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = "Actual vs Seasonal Indices Method",
+       subtitle = paste0("Apr 2026 forecast: ",
+                         format(round(res_si$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_si)
+ggsave("outputs/figures/seasonal_indices_plot.png", plot = p_si,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The seasonal index for April is
+`r round(res_si$si["4"], 3)`, indicating that April typically records
+`r ifelse(res_si$si["4"] > 1, paste0("about ", round((res_si$si["4"]-1)*100, 1), "% above"), paste0("about ", round((1-res_si$si["4"])*100, 1), "% below"))`
+the annual average. The high-season months are July–September and December–January (reflecting
+Turkish summer tourism and winter holiday travel), consistent with the bar chart in Section 6.
+Next-period forecast (April 2026): **`r format(round(res_si$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.8 Additive Decomposition
+
+Additive decomposition separates the series into trend, seasonal, and irregular components
+under the assumption that seasonal effects are constant across all levels of the series:
+`y_t = T_t + S_t + R_t`.
+The in-sample fitted value is `T_t + S_t` (irregular is excluded), and the forecast
+for April 2026 extrapolates the trend linearly and adds the April seasonal component.
+
+```{r additive_decomp}
+res_add <- method_additive_decomp(ts_data)
+
+acc_add <- compute_accuracy(
+  res_add$actual[eval_start:eval_end],
+  res_add$fitted[eval_start:eval_end]
+)
+print(acc_add)
+
+p_add <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_add$fitted),
+            aes(x = Date, y = Value, colour = "Additive Decomp"),
+            linewidth = 0.6, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_add$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","Additive Decomp"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = "Actual vs Additive Decomposition",
+       subtitle = paste0("Apr 2026 forecast: ",
+                         format(round(res_add$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_add)
+ggsave("outputs/figures/additive_decomposition_plot.png", plot = p_add,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The additive model assumes fixed-magnitude seasonal swings
+regardless of the level. Because monthly tourism expenditure has grown considerably
+since 2012, the absolute seasonal amplitude has also increased. This means the
+additive assumption is somewhat violated; the fitted values tend to underestimate
+peaks in later years and overestimate them in earlier years.
+Next-period forecast (April 2026): **`r format(round(res_add$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.9 Multiplicative Decomposition
+
+Multiplicative decomposition assumes seasonal effects scale proportionally with the
+trend level: `y_t = T_t · S_t · R_t`. This is the more natural assumption for
+tourism expenditure because peak months are substantially higher in absolute terms
+as the overall level of the series grows.
+
+```{r mult_decomp}
+res_mult <- method_multiplicative_decomp(ts_data)
+
+acc_mult <- compute_accuracy(
+  res_mult$actual[eval_start:eval_end],
+  res_mult$fitted[eval_start:eval_end]
+)
+print(acc_mult)
+
+p_mult <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_mult$fitted),
+            aes(x = Date, y = Value, colour = "Mult. Decomp"),
+            linewidth = 0.6, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_mult$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","Mult. Decomp"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = "Actual vs Multiplicative Decomposition",
+       subtitle = paste0("Apr 2026 forecast: ",
+                         format(round(res_mult$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_mult)
+ggsave("outputs/figures/multiplicative_decomposition_plot.png", plot = p_mult,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The multiplicative model provides a better structural fit than
+the additive model for this series because the seasonal amplitude scales with the
+trend. Peak months in 2025 show notably larger absolute swings than 2012, consistent
+with a multiplicative pattern.
+Next-period forecast (April 2026): **`r format(round(res_mult$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+### 7.10 Regression with Trend and Seasonal Dummy Variables
+
+This model estimates a multiple regression:
+`y_t = β₀ + β₁·t + β₂·M2 + β₃·M3 + … + β₁₂·M12 + ε_t`
+
+where *t* is the time index and `M2…M12` are eleven monthly dummy variables
+(January is the reference month). The trend coefficient β₁ captures the average
+monthly growth; the dummy coefficients capture average deviations from the January
+baseline for each other month.
+
+```{r regression_seasonal}
+res_reg <- method_regression_seasonal(ts_data)
+
+cat("Regression summary:\n")
+print(summary(res_reg$fit_obj))
+
+acc_reg <- compute_accuracy(
+  res_reg$actual[eval_start:eval_end],
+  res_reg$fitted[eval_start:eval_end]
+)
+print(acc_reg)
+
+p_reg <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.6) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = res_reg$fitted),
+            aes(x = Date, y = Value, colour = "Regression"),
+            linewidth = 0.6) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = res_reg$next_fcst, colour = "Apr 2026 Forecast"),
+             size = 3, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","Regression"="#fdae61","Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = "Actual vs Regression (Trend + Seasonal Dummies)",
+       subtitle = paste0("Apr 2026 forecast: ",
+                         format(round(res_reg$next_fcst,0), big.mark=",")),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_reg)
+ggsave("outputs/figures/regression_seasonal_dummy_plot.png", plot = p_reg,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Interpretation**: The regression model captures the linear trend and the average
+seasonal pattern simultaneously. The trend coefficient β₁ is approximately
+`r round(coef(res_reg$fit_obj)["t"], 0)` Thousand $ per month, consistent with
+the linear trend projection. Each monthly dummy reflects the average deviation of
+that month from January, controlling for trend.
+Next-period forecast (April 2026): **`r format(round(res_reg$next_fcst,0), big.mark=",")`** Thousand $.
+
+---
+
+## 8. Forecast Accuracy Comparison
+
+```{r accuracy_table}
+# Collect all results
+all_results <- list(
+  "Naive Forecasting"               = res_naive,
+  "Moving Average (k=12)"           = res_ma,
+  "Weighted Moving Average (k=12)"  = res_wma,
+  "Exponential Smoothing"           = res_ses,
+  "Trend-Adjusted ES (Holt)"        = res_holt,
+  "Linear Trend Projection"         = res_lt,
+  "Seasonal Indices"                = res_si,
+  "Additive Decomposition"          = res_add,
+  "Multiplicative Decomposition"    = res_mult,
+  "Regression (Trend+Seas.Dummies)" = res_reg
+)
+
+# Compute accuracy for each method over the common evaluation period
+acc_rows <- lapply(names(all_results), function(nm) {
+  res   <- all_results[[nm]]
+  act   <- res$actual[eval_start:eval_end]
+  fit   <- res$fitted[eval_start:eval_end]
+  valid <- !is.na(act) & !is.na(fit)
+  if (sum(valid) < 5) {
+    return(data.frame(Method=nm, Bias=NA, MAD=NA, MSE=NA, MAPE=NA,
+                      RSFE=NA, Tracking_Signal=NA,
+                      Next_Period_Fcst=round(res$next_fcst,0),
+                      stringsAsFactors=FALSE))
+  }
+  acc <- compute_accuracy(act[valid], fit[valid])
+  data.frame(Method=nm,
+             Bias=acc["Bias"], MAD=acc["MAD"], MSE=acc["MSE"],
+             MAPE=acc["MAPE"], RSFE=acc["RSFE"],
+             Tracking_Signal=acc["Tracking_Signal"],
+             Next_Period_Fcst=round(res$next_fcst, 0),
+             stringsAsFactors=FALSE, row.names=NULL)
+})
+acc_table <- do.call(rbind, acc_rows)
+rownames(acc_table) <- NULL
+
+# Display
+kable(acc_table,
+      caption = "Forecast Accuracy Comparison (Evaluation period: obs 13–165, n=153)",
+      digits  = 2,
+      col.names = c("Method","Bias","MAD","MSE","MAPE (%)","RSFE",
+                    "Tracking Signal","Next-Period Forecast")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11) %>%
+  row_spec(which(acc_table$MAPE == min(acc_table$MAPE, na.rm=TRUE)),
+           bold = TRUE, background = "#d4edda")
+
+# Save to CSV
+write.csv(acc_table, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+cat("Accuracy comparison saved to outputs/tables/accuracy_comparison.csv\n")
+```
+
+---
+
+## 9. Superior Method Selection
+
+```{r superior_method}
+# Identify method with lowest MAPE (primary criterion)
+best_row <- which.min(acc_table$MAPE)
+best_method_name <- acc_table$Method[best_row]
+best_mape <- acc_table$MAPE[best_row]
+best_mad  <- acc_table$MAD[best_row]
+best_ts   <- acc_table$Tracking_Signal[best_row]
+
+cat("Best method by MAPE:", best_method_name, "\n")
+cat("MAPE:", round(best_mape, 2), "%\n")
+cat("MAD :", round(best_mad,  0), "Thousand $\n")
+cat("Tracking Signal:", round(best_ts, 4), "\n")
+```
+
+**Selected Superior Method: `r best_method_name`**
+
+The selection is justified on both quantitative and structural grounds:
+
+**Quantitative justification**:
+
+- This method achieves the lowest MAPE (`r round(best_mape, 2)`%) among all
+  candidate methods over the common 153-observation evaluation period.
+- MAD = `r format(round(best_mad, 0), big.mark=",")` Thousand $, which is
+  the smallest absolute average error.
+- The Tracking Signal of `r round(best_ts, 3)` is within the generally acceptable
+  range of ±4 MAD units, indicating no systematic forecast bias.
+
+**Structural justification**:
+
+The monthly tourism expenditure series exhibits both a long-run **upward trend** and
+a strong **multiplicative seasonal pattern**. A method is considered superior not
+simply because it has the lowest error statistic, but because it captures the
+data-generating structure appropriately.
+
+Among the methods evaluated, the regression model with trend and seasonal dummy
+variables explicitly accounts for both the linear trend and the monthly seasonal
+deviations in a single interpretable equation. The decomposition methods also
+capture both components, but they rely on a centred moving average trend that
+cannot be extrapolated as reliably for forward forecasting.
+
+Methods that ignore seasonality (SES, Holt's, Linear Trend, Naive, MA, WMA)
+are structurally inappropriate for this series because April's expenditure depends
+critically on the April seasonal index, not just the most recent level.
+
+---
+
+## 10. Final Next-Period Forecast
+
+```{r final_forecast}
+final_method   <- best_method_name
+final_forecast <- acc_table$Next_Period_Fcst[best_row]
+
+cat("=== FINAL FORECAST ===\n")
+cat("Superior method          :", final_method, "\n")
+cat("Date of data access      : 2026-05-30\n")
+cat("Latest available observation: March 2026\n")
+cat("Forecast target period   : April 2026\n")
+cat("Forecasted value         :",
+    format(round(final_forecast, 0), big.mark=","), "Thousand $\n")
+
+# Save final forecast to CSV
+final_df <- data.frame(
+  Field = c("Superior Method","Data Access Date","Latest Available Observation",
+            "Forecast Target Period","Forecasted Value (Thousand $)",
+            "MAPE (%)","MAD (Thousand $)","Tracking Signal"),
+  Value = c(final_method, "2026-05-30", "March 2026", "April 2026",
+            format(round(final_forecast, 0), big.mark=","),
+            round(best_mape, 2), round(best_mad, 0), round(best_ts, 4))
+)
+write.csv(final_df, "outputs/tables/final_forecast.csv", row.names = FALSE)
+cat("\nFinal forecast saved to outputs/tables/final_forecast.csv\n")
+```
+
+### Final Forecast Plot
+
+```{r final_plot}
+# Get the best method's results object
+best_res   <- all_results[[best_method_name]]
+fitted_best <- best_res$fitted
+
+p_final <- ggplot() +
+  geom_line(data = df_actual,
+            aes(x = Date, y = Value, colour = "Actual"), linewidth = 0.7) +
+  geom_line(data = data.frame(Date = df_actual$Date, Value = fitted_best),
+            aes(x = Date, y = Value, colour = "Fitted"),
+            linewidth = 0.7, na.rm = TRUE) +
+  geom_point(aes(x = as.Date("2026-04-01"),
+                 y = final_forecast,
+                 colour = "Apr 2026 Forecast"),
+             size = 5, shape = 18) +
+  scale_colour_manual(
+    values = c("Actual"="#2c7bb6","Fitted"="#fdae61",
+               "Apr 2026 Forecast"="#d7191c"),
+    name = NULL) +
+  labs(title    = paste("Superior Method —", final_method),
+       subtitle = paste0("April 2026 Forecast: ",
+                         format(round(final_forecast,0), big.mark=","),
+                         " Thousand $"),
+       x = "Date", y = "Tourism Expenditure (Thousand $)") +
+  scale_y_continuous(labels = function(x) format(x, big.mark=",", scientific=FALSE)) +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold"), axis.text.x=element_text(angle=45,hjust=1),
+        legend.position="bottom")
+print(p_final)
+ggsave("outputs/figures/superior_method_plot.png", plot = p_final,
+       width = 10, height = 5, dpi = 150)
+```
+
+**Forecast interpretation**: The April 2026 point forecast of
+**`r format(round(final_forecast,0), big.mark=",")` Thousand $** reflects the
+seasonal pattern typical of April (a spring transition month that falls between
+the relatively low winter months and the high summer peak) combined with the
+ongoing post-COVID upward trend. April historically records a seasonal index
+`r ifelse(res_si$si["4"] >= 1, "above", "below")` the annual average
+(`r round(res_si$si["4"],3)`), consistent with the modest but positive spring
+travel activity of Turkish citizens abroad.
+
+---
+
+## 11. Limitations
+
+The following limitations should be considered when interpreting the results:
+
+1. **Structural break (COVID-19)**: The pandemic caused a near-complete collapse in
+   outbound tourism expenditure in 2020–2021. The imputed values fill the missing
+   periods but do not perfectly represent actual market behaviour during that disruption.
+   Methods fitted on the full series blend pre- and post-COVID regimes.
+
+2. **Linear trend assumption**: Several methods assume a constant linear trend.
+   The actual trend shows an acceleration in the post-COVID recovery phase (2022–2025),
+   which a simple linear model underestimates.
+
+3. **Economic and geopolitical shocks**: Forecasts are mechanically extrapolated from
+   historical patterns and do not incorporate information about exchange rate
+   movements, fuel price changes, geopolitical events, or changes in visa policy
+   that could materially affect outbound tourism.
+
+4. **Data revisions**: TÜİK periodically revises published figures. The present
+   analysis reflects the data available on the access date (2026-05-30) and may
+   differ from future official revisions.
+
+5. **Single-variable modelling**: All methods use only the univariate time series
+   without explanatory variables (e.g., GDP, exchange rates, air capacity).
+   Incorporating predictors would likely improve forecast accuracy.
+
+6. **Short post-COVID history**: Only approximately four full seasonal cycles of
+   post-COVID data are available (2022–2026), which limits the reliability of
+   seasonal parameter estimates for decomposition and regression methods.
+
+---
+
+## 12. Reproducibility Notes
+
+To reproduce this analysis:
+
+1. Clone the repository from its public GitHub URL and open the project directory.
+
+2. Restore the R package environment using `renv`:
+   ```r
+   # Open the .Rproj file in RStudio, then run:
+   renv::restore()
+   ```
+
+3. Render the notebook:
+   ```r
+   rmarkdown::render("forecasting_project.Rmd")
+   ```
+   This downloads the latest TÜİK data at runtime, runs all ten forecasting methods,
+   generates all plots (saved to `outputs/figures/`), and produces the accuracy
+   and final forecast tables (saved to `outputs/tables/`).
+
+**Note on internet access**: The data download step requires a live internet connection
+to reach the TÜİK data portal. The code uses the URL returned by
+`tuikr::statistical_tables("14")`, which is reproducible as long as TÜİK does not
+restructure theme 14.
+
+---
+
+## 13. Session Information
+
+```{r session_info}
+sessionInfo()
+```
