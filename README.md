@@ -234,4 +234,4 @@ tuik-forecasting-project/
 
 - **Student Name**: Melike Alara Göler
 - **Student Number**: 138722041
-- **Course**: Forecasting Methods
+- **Course**: Quantitative Analysis and Decision Making 
